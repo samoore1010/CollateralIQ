@@ -8,6 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist",
+    "reset-db": "rm -rf .data",
     "lint": "tsc --noEmit"
   },
   "dependencies": {
