@@ -1,5 +1,6 @@
 import type {
   Transaction, TransactionFull, Asset, Filing, Covenant, Listing, Buyer, Alert, AuditEntry,
+  SourceAttribution, ThirdPartyFiling, DebtorWatch, Debtor,
 } from './types';
 
 const BASE = '/api';
@@ -60,6 +61,18 @@ export const api = {
 
   intelligence: () => req<any>('/intelligence'),
   settings: () => req<Record<string, string>>('/settings'),
+
+  debtors: () => req<Debtor[]>('/debtors'),
+  repayDraw: (id: string) => req<{ ok: boolean }>(`/draws/${id}/repay`, { method: 'POST', body: '{}' }),
+
+  monitoringStats: () => req<{ debtors_watched: number; active_jurisdictions: number; detected_30d: number; unreviewed: number }>('/monitoring/stats'),
+  monitoringFilings: (debtor_id?: string) => req<ThirdPartyFiling[]>(`/monitoring/filings${debtor_id ? `?debtor_id=${debtor_id}` : ''}`),
+  monitoringWatches: () => req<DebtorWatch[]>('/monitoring/watches'),
+  reviewTpf: (id: string) => req<{ ok: boolean }>(`/monitoring/filings/${id}/review`, { method: 'POST', body: '{}' }),
+  simulateMonitoring: () => req<{ id: string }>('/monitoring/simulate', { method: 'POST', body: '{}' }),
+
+  attributions: (entity_type: string, entity_id: string) =>
+    req<SourceAttribution[]>(`/attributions?entity_type=${entity_type}&entity_id=${encodeURIComponent(entity_id)}`),
 };
 
 export function fmtCents(c: number | null | undefined): string {

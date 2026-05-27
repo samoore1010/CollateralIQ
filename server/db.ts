@@ -211,9 +211,175 @@ CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT
 );
+
+-- Change 2: multi-debtor support
+CREATE TABLE IF NOT EXISTS debtors (
+  id TEXT PRIMARY KEY,
+  legal_name TEXT NOT NULL,
+  normalized_name TEXT NOT NULL,
+  organization_form TEXT,
+  state_of_formation TEXT,
+  fein TEXT,
+  org_id TEXT,
+  prior_names_json TEXT,
+  registered_address TEXT,
+  is_active INTEGER DEFAULT 1,
+  created_at INTEGER,
+  updated_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_debtors_normalized_name ON debtors(normalized_name);
+
+CREATE TABLE IF NOT EXISTS transaction_debtors (
+  id TEXT PRIMARY KEY,
+  transaction_id TEXT NOT NULL,
+  debtor_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  joined_at TEXT,
+  released_at TEXT,
+  created_at INTEGER,
+  UNIQUE(transaction_id, debtor_id)
+);
+CREATE INDEX IF NOT EXISTS idx_transaction_debtors_tx ON transaction_debtors(transaction_id);
+CREATE INDEX IF NOT EXISTS idx_transaction_debtors_debtor ON transaction_debtors(debtor_id);
+
+-- Change 3: draw/tranche hierarchy
+CREATE TABLE IF NOT EXISTS draws (
+  id TEXT PRIMARY KEY,
+  transaction_id TEXT NOT NULL,
+  label TEXT NOT NULL,
+  draw_type TEXT,
+  commitment_cents INTEGER NOT NULL,
+  drawn_cents INTEGER DEFAULT 0,
+  outstanding_cents INTEGER DEFAULT 0,
+  available_from TEXT,
+  available_until TEXT,
+  drawn_date TEXT,
+  term_months INTEGER,
+  rate_factor REAL,
+  collateral_pool TEXT,
+  status TEXT NOT NULL,
+  repaid_date TEXT,
+  notes TEXT,
+  created_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_draws_tx ON draws(transaction_id);
+CREATE INDEX IF NOT EXISTS idx_draws_status ON draws(status);
+
+-- Change 4: UCC monitoring (incoming intelligence)
+CREATE TABLE IF NOT EXISTS debtor_watches (
+  id TEXT PRIMARY KEY,
+  debtor_id TEXT NOT NULL,
+  watch_jurisdiction TEXT NOT NULL,
+  status TEXT NOT NULL,
+  last_checked_at INTEGER,
+  next_check_at INTEGER,
+  created_at INTEGER,
+  UNIQUE(debtor_id, watch_jurisdiction)
+);
+
+CREATE TABLE IF NOT EXISTS third_party_filings (
+  id TEXT PRIMARY KEY,
+  debtor_id TEXT NOT NULL,
+  jurisdiction TEXT NOT NULL,
+  filing_type TEXT NOT NULL,
+  secured_party TEXT NOT NULL,
+  collateral_description TEXT,
+  file_number TEXT,
+  filed_at TEXT,
+  lapse_date TEXT,
+  terminated_at TEXT,
+  detected_at INTEGER,
+  priority_impact TEXT,
+  priority_impact_reason TEXT,
+  reviewed INTEGER DEFAULT 0,
+  source TEXT,
+  raw_payload_json TEXT,
+  created_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_tpf_debtor ON third_party_filings(debtor_id);
+CREATE INDEX IF NOT EXISTS idx_tpf_reviewed ON third_party_filings(reviewed);
+CREATE INDEX IF NOT EXISTS idx_tpf_priority ON third_party_filings(priority_impact);
+
+-- Change 5: source provenance
+CREATE TABLE IF NOT EXISTS source_attributions (
+  id TEXT PRIMARY KEY,
+  entity_type TEXT NOT NULL,
+  entity_id TEXT NOT NULL,
+  field_path TEXT,
+  source_type TEXT NOT NULL,
+  source_reference TEXT,
+  retrieved_at INTEGER NOT NULL,
+  notes TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_attr_entity ON source_attributions(entity_type, entity_id);
 `;
 
 db.exec(SCHEMA);
+
+// Idempotent column additions on existing databases
+ensureColumn('filings', 'debtor_id', 'TEXT');
+ensureColumn('collateral', 'draw_id', 'TEXT');
+
+function ensureColumn(table: string, column: string, definition: string) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (!cols.find(c => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+export function normalizeName(s: string): string {
+  return s.toLowerCase().replace(/[.,]/g, '').replace(/\b(inc|incorporated|corporation|corp|llc|ltd|limited|lp|company|co)\b/g, '').replace(/\s+/g, ' ').trim();
+}
+
+export function inferOrgForm(name: string): string {
+  const lc = name.toLowerCase();
+  if (/\bllc\b/.test(lc)) return 'llc';
+  if (/\b(inc|incorporated|corp|corporation)\b/.test(lc)) return 'corporation';
+  if (/\blp\b/.test(lc)) return 'lp';
+  return 'corporation';
+}
+
+const STATE_MAP: Record<string, string> = {
+  delaware: 'DE', 'new york': 'NY', texas: 'TX', nevada: 'NV', massachusetts: 'MA',
+  california: 'CA', 'new mexico': 'NM', 'district of columbia': 'DC',
+};
+export function jurisdictionToCode(j: string): string {
+  if (!j) return '';
+  if (j.length === 2 && j === j.toUpperCase()) return j;
+  return STATE_MAP[j.toLowerCase()] ?? j.slice(0, 2).toUpperCase();
+}
+
+/**
+ * Idempotent backfill that runs on every startup. Ensures every transaction
+ * has at least a 'parent' debtor row and a 'Primary' draw row so existing
+ * single-borrower / single-tranche deals continue to render correctly under
+ * the new multi-debtor / multi-draw model.
+ */
+export function runBackfill() {
+  const txs = db.prepare('SELECT * FROM transactions').all() as any[];
+  const findDebtor = db.prepare('SELECT id FROM debtors WHERE normalized_name = ?');
+  const insertDebtor = db.prepare(`INSERT INTO debtors (id, legal_name, normalized_name, organization_form, state_of_formation, is_active, created_at, updated_at) VALUES (?,?,?,?,?,1,?,?)`);
+  const txDebtorCount = db.prepare('SELECT COUNT(*) AS c FROM transaction_debtors WHERE transaction_id = ?');
+  const insertTxDebtor = db.prepare(`INSERT OR IGNORE INTO transaction_debtors (id, transaction_id, debtor_id, role, joined_at, created_at) VALUES (?,?,?,?,?,?)`);
+  const drawCount = db.prepare('SELECT COUNT(*) AS c FROM draws WHERE transaction_id = ?');
+  const insertDraw = db.prepare(`INSERT INTO draws (id, transaction_id, label, draw_type, commitment_cents, drawn_cents, outstanding_cents, status, collateral_pool, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`);
+
+  for (const tx of txs) {
+    if ((txDebtorCount.get(tx.id) as any).c === 0) {
+      const normalized = normalizeName(tx.borrower);
+      let debtor = findDebtor.get(normalized) as { id: string } | undefined;
+      if (!debtor) {
+        const id = crypto.randomUUID();
+        insertDebtor.run(id, tx.borrower, normalized, inferOrgForm(tx.borrower), jurisdictionToCode(tx.jurisdiction), Date.now(), Date.now());
+        debtor = { id };
+      }
+      insertTxDebtor.run(crypto.randomUUID(), tx.id, debtor.id, 'parent', tx.closing_date, Date.now());
+    }
+    if ((drawCount.get(tx.id) as any).c === 0) {
+      insertDraw.run(crypto.randomUUID(), tx.id, 'Primary', 'term', tx.amount_cents, tx.amount_cents, tx.amount_cents, 'outstanding', 'equipment', Date.now());
+    }
+  }
+}
 
 export function logAudit(opts: {
   actor_role: string;

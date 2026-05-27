@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
-  TrendingUp, AlertTriangle, CheckCircle2, DollarSign, PieChart as PieChartIcon, Activity, Zap,
+  TrendingUp, AlertTriangle, CheckCircle2, DollarSign, PieChart as PieChartIcon, Activity, Zap, Rocket, ArrowRight,
 } from 'lucide-react';
 import {
   PieChart, Pie, Cell, ResponsiveContainer, Tooltip as RechartsTooltip, BarChart, Bar, XAxis, YAxis, CartesianGrid,
@@ -9,6 +9,7 @@ import {
 import { cn } from '@/lib/utils';
 import { api, fmtCents } from '@/api';
 import { DemoChip } from '@/components/DemoChip';
+import { useApp } from '@/context/AppContext';
 import type { Transaction, Alert } from '@/types';
 
 const SECTOR_COLORS = ['#4F46E5', '#0EA5E9', '#10B981', '#F59E0B', '#64748B', '#A855F7', '#EC4899', '#14B8A6'];
@@ -33,6 +34,7 @@ const StatCard = ({ title, value, change, icon: Icon, trend, chip }: any) => (
 );
 
 export default function Dashboard() {
+  const { settings } = useApp();
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [intel, setIntel] = useState<any>(null);
@@ -44,6 +46,7 @@ export default function Dashboard() {
     api.intelligence().then(setIntel);
   };
   useEffect(() => { load(); }, []);
+  const featured = transactions.find(t => t.id === settings.featured_transaction_id);
 
   const total = transactions.reduce((s, t) => s + t.amount_cents, 0);
   const active = transactions.length;
@@ -73,6 +76,30 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-8">
+      {featured && (
+        <Link to={`/transactions/${featured.id}`}
+          className="block relative overflow-hidden rounded-xl border border-indigo-200 bg-gradient-to-br from-indigo-600 via-indigo-700 to-slate-900 text-white p-6 hover:shadow-lg transition-shadow">
+          <div className="relative z-10 flex items-start justify-between gap-6">
+            <div>
+              <div className="flex items-center gap-2 text-indigo-200 text-xs uppercase tracking-wider font-semibold mb-1">
+                <Rocket className="w-4 h-4" /> Featured deal · public-record demo
+              </div>
+              <div className="flex items-center gap-3 flex-wrap">
+                <h2 className="text-2xl font-bold">{featured.borrower}</h2>
+                <span className="text-xs px-2 py-0.5 rounded-full bg-white/15 border border-white/30">{featured.deal_type}</span>
+              </div>
+              <p className="text-sm text-indigo-100 mt-2 max-w-2xl">
+                Trinity Capital × Rocket Lab — {fmtCents(featured.amount_cents)} master equipment financing facility with eleven co-borrowers, a four-tranche draw structure, and a blanket lien that collapsed mid-term. Sourced from SEC EDGAR Exhibit 10.29.
+              </p>
+            </div>
+            <div className="flex items-center gap-2 text-sm font-medium shrink-0">
+              Open deal <ArrowRight className="w-4 h-4" />
+            </div>
+          </div>
+          <div className="absolute -right-20 -bottom-20 w-64 h-64 bg-white/5 rounded-full blur-3xl" />
+        </Link>
+      )}
+
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         <StatCard title="Total Secured Exposure" value={fmtCents(total)} change={`${transactions.length} active deals`} icon={DollarSign} trend="up" />
         <StatCard title="Active Transactions" value={active} change="+2 this quarter" icon={TrendingUp} trend="up" />
