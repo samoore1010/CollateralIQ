@@ -2,7 +2,7 @@ import React from 'react';
 import { NavLink, Outlet, useLocation } from 'react-router-dom';
 import {
   LayoutDashboard, FileText, Package, ShoppingBag, Layers, Bell, Search, User,
-  FileCheck, ClipboardCheck, Gavel, BarChart3, ShieldCheck, ChevronDown,
+  FileCheck, ClipboardCheck, Gavel, BarChart3, ShieldCheck, ChevronDown, Radar,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { DemoBanner } from '@/components/DemoChip';
@@ -22,6 +22,7 @@ const NAV: Array<{ section: string; items: Array<{ icon: any; label: string; to:
     section: 'Workflow',
     items: [
       { icon: FileCheck, label: 'UCC Filings', to: '/filings', roles: ['legal', 'pm', 'compliance', 'workout'] },
+      { icon: Radar, label: 'UCC Monitoring', to: '/monitoring', roles: ['legal', 'pm', 'compliance', 'workout'] },
       { icon: ClipboardCheck, label: 'Compliance', to: '/compliance', roles: ['pm', 'compliance', 'legal'] },
       { icon: Gavel, label: 'Disposition', to: '/disposition', roles: ['workout', 'pm', 'legal'] },
     ],
@@ -70,6 +71,7 @@ export default function Layout() {
       transactions: 'Transactions & UCC',
       collateral: 'Collateral Vault',
       filings: 'UCC Filing Workflow',
+      monitoring: 'UCC Monitoring',
       compliance: 'Covenant Compliance',
       disposition: 'Article 9 Disposition',
       marketplace: 'Disposition Marketplace',

@@ -1,8 +1,19 @@
-import { db, parseAmount } from './db';
+import { db, parseAmount, runBackfill, normalizeName, inferOrgForm } from './db';
+
+/**
+ * Idempotent migrations: safe to call on every startup. Brings any existing
+ * database up to current expectations (debtors/draws backfill, Trinity deal,
+ * monitoring + provenance seed) without disturbing anything already present.
+ */
+export function runMigrations() {
+  runBackfill();
+  seedTrinityRocketLab();
+  seedMonitoringAndAttributions();
+}
 
 export function seedIfEmpty() {
   const existing = db.prepare('SELECT COUNT(*) AS c FROM transactions').get() as { c: number };
-  if (existing.c > 0) return;
+  if (existing.c > 0) { runMigrations(); return; }
   console.log('[seed] populating CollateralIQ database…');
 
   const now = Date.now();
@@ -209,7 +220,241 @@ export function seedIfEmpty() {
   setting.run('filing_partner', 'CSC Global (Sandbox)');
   setting.run('buyer_network_partner', 'BidConnect Network (Demo)');
 
+  // ---------- Trinity Capital × Rocket Lab flagship scenario ----------
+  seedTrinityRocketLab();
+
+  // Backfill debtors/draws for all existing transactions (the 10 above).
+  runBackfill();
+
+  // ---------- baseline UCC monitoring data + provenance ----------
+  seedMonitoringAndAttributions();
+
   console.log('[seed] done.');
+}
+
+function seedTrinityRocketLab() {
+  const TX = 'TRX-2023-011';
+  const exists = db.prepare('SELECT id FROM transactions WHERE id = ?').get(TX);
+  if (exists) return;
+  // Atomic seed — if anything fails (stale rows from a partial migration, etc.) roll back so we can retry cleanly next boot.
+  const tx = db.transaction(() => seedTrinityRocketLabInner());
+  try { tx(); } catch (e: any) {
+    console.warn('[seed] Trinity × Rocket Lab seed skipped:', e?.message);
+  }
+}
+
+function seedTrinityRocketLabInner() {
+  const now = Date.now();
+  const TX = 'TRX-2023-011';
+
+  db.prepare(`INSERT INTO transactions (id, borrower, deal_type, amount_cents, closing_date, maturity_date, jurisdiction, governing_law, collateral_type, agent_firm, our_share_pct, intercreditor_tranche, created_at)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(TX, 'Rocket Lab USA, Inc.', 'Master Equipment Financing', 120_000_000_00, '2023-12-29', '2029-01-31', 'Delaware', 'New York', 'Equipment + Blanket (conditional)', 'CollateralIQ (Sole)', 100, 'first-lien', now);
+
+  // Contacts (no public disclosure; reasonable placeholders)
+  const contacts = db.prepare('INSERT INTO contacts (transaction_id, role, name, firm, email) VALUES (?, ?, ?, ?, ?)');
+  contacts.run(TX, 'Lender (Us)', 'Trinity Capital Inc.', 'Trinity Capital', 'origination@trinitycap.example');
+  contacts.run(TX, 'Borrower', 'Adam Spice', 'Rocket Lab USA, Inc. (CFO)', 'cfo@rocketlab.example');
+  contacts.run(TX, 'Borrower Counsel', '— (per Exhibit 10.29)', 'Cooley LLP', 'rocketlab@cooley.example');
+
+  // Mechanics — includes warrant per agreement
+  const mech = db.prepare('INSERT INTO mechanics (transaction_id, label, value) VALUES (?, ?, ?)');
+  mech.run(TX, 'Rate Factor', '0.022266 monthly (effective ~13.5% APR)');
+  mech.run(TX, 'Term', '60 months from each draw');
+  mech.run(TX, 'Final Draw Period', 'Through 2029-01-31');
+  mech.run(TX, 'Warrant', '728,835 RKLB shares @ $4.87 strike, exp 2027-12-29, cashless available');
+  mech.run(TX, 'Predecessor Lender', 'Hercules Capital ($108,648,103 paid off & released)');
+  mech.run(TX, 'Change of Control Trigger', '49% beneficial ownership shift OR board majority turnover (12mo)');
+
+  // Rights / obligations
+  const rights = db.prepare('INSERT INTO rights (transaction_id, title, description, status) VALUES (?, ?, ?, ?)');
+  rights.run(TX, 'Annual audited financials', 'Within 180 days of FY-end (auto-satisfied by 10-K filing).', 'active');
+  rights.run(TX, 'Quarterly unaudited financials', 'Within 45 days of quarter-end (auto-satisfied by 10-Q).', 'active');
+  rights.run(TX, 'Monthly unaudited financials', 'Within 30 days for non-quarter-end months.', 'active');
+  rights.run(TX, 'Equipment Location Report', 'Within 30 days of lender request.', 'active');
+  rights.run(TX, 'Blanket-Lien-Conditional Covenants', 'Released upon Blanket Lien Draw repayment (Q3 2025).', 'released');
+  rights.run(TX, 'Permitted Debt Covenant', 'No Debt beyond Permitted Debt — RELEASED with Blanket Lien Draw.', 'released');
+  rights.run(TX, 'IP Transfer Restriction', 'No IP transfers absent enumerated exceptions — RELEASED.', 'released');
+  rights.run(TX, 'Warrant', '728,835 RKLB shares; auto cashless exercise at expiration if ITM.', 'active');
+
+  // ---------- 11 co-borrowers ----------
+  const insertDebtor = db.prepare(`INSERT INTO debtors (id, legal_name, normalized_name, organization_form, state_of_formation, registered_address, is_active, created_at, updated_at) VALUES (?,?,?,?,?,?,1,?,?)`);
+  const insertTxDebtor = db.prepare(`INSERT INTO transaction_debtors (id, transaction_id, debtor_id, role, joined_at, created_at) VALUES (?,?,?,?,?,?)`);
+
+  const coBorrowers: Array<[string, string, 'parent' | 'co-borrower', string]> = [
+    ['Rocket Lab USA, Inc.', 'DE', 'parent', '3881 McGowen St, Long Beach CA 90808'],
+    ['Rocket Lab Global Services, LLC', 'DE', 'co-borrower', '3881 McGowen St, Long Beach CA 90808'],
+    ['ASI Aerospace LLC', 'DE', 'co-borrower', 'Albuquerque NM'],
+    ['Planetary Systems Corporation', 'DC', 'co-borrower', 'Silver Spring MD'],
+    ['SolAero Holdings, Inc.', 'DE', 'co-borrower', '10420 Research Rd SE, Albuquerque NM 87123'],
+    ['SolAero, LLC', 'DE', 'co-borrower', 'Albuquerque NM'],
+    ['SolAero Technologies Corp', 'DE', 'co-borrower', 'Albuquerque NM'],
+    ['SolAero Solar Power LLC', 'DE', 'co-borrower', 'Albuquerque NM'],
+    ['SolAero IRB Company LLC', 'NM', 'co-borrower', 'Albuquerque NM'],
+    ['Rocket Lab National Security LLC', 'DE', 'co-borrower', 'Washington DC'],
+    ['Rocket Lab Composites, LLC', 'DE', 'co-borrower', 'Auburn WA'],
+  ];
+
+  const rocketLabDebtors: Record<string, string> = {};
+  for (const [name, state, role, addr] of coBorrowers) {
+    const id = crypto.randomUUID();
+    insertDebtor.run(id, name, normalizeName(name), inferOrgForm(name), state, addr, Date.now(), Date.now());
+    insertTxDebtor.run(crypto.randomUUID(), TX, id, role, '2023-12-29', Date.now());
+    rocketLabDebtors[name] = id;
+  }
+
+  // ---------- 4 draws ----------
+  const insertDraw = db.prepare(`INSERT INTO draws (id, transaction_id, label, draw_type, commitment_cents, drawn_cents, outstanding_cents, available_from, available_until, drawn_date, term_months, rate_factor, collateral_pool, status, repaid_date, notes, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+
+  const drawEff = crypto.randomUUID();
+  insertDraw.run(drawEff, TX, 'Effective Date Draw', 'term', 70_000_000_00, 70_000_000_00, 70_000_000_00, '2023-12-29', '2023-12-29', '2023-12-29', 60, 0.022266, 'equipment', 'outstanding', null, '§1(a) — funded refinance of Hercules Capital and equipment package.', Date.now());
+
+  const drawBlanket = crypto.randomUUID();
+  insertDraw.run(drawBlanket, TX, 'Blanket Lien Draw', 'term', 40_000_000_00, 40_000_000_00, 0, '2023-12-29', '2023-12-29', '2023-12-29', 60, 0.022266, 'blanket', 'repaid', '2025-09-30', '§1(b) — blanket lien tranche; repaid by Q3 2025 per RKLB 10-Q. Triggered release of blanket-conditional covenants and UCC-3 amendment to narrow collateral description.', Date.now());
+
+  const drawCondA = crypto.randomUUID();
+  insertDraw.run(drawCondA, TX, 'Conditional Draw A', 'conditional', 30_000_000_00, 0, 0, '2023-12-29', '2025-06-29', null, 60, 0.022266, 'equipment', 'expired', null, '§1(c) — available up to 18 months post-Effective Date in ≥$10M advances. Not drawn within window.', Date.now());
+
+  const drawCondB = crypto.randomUUID();
+  insertDraw.run(drawCondB, TX, 'Conditional Draw B', 'conditional', 20_000_000_00, 0, 0, '2025-01-01', '2025-06-30', null, 60, 0.022266, 'equipment', 'expired', null, '§1(d) — narrow 6-month draw window. Not drawn.', Date.now());
+
+  // ---------- Collateral (illustrative equipment package) ----------
+  const col = db.prepare(`INSERT INTO collateral (id, transaction_id, name, category, a9_category, perfection_method, market_value_cents, liquidation_value_cents, original_cost_cents, location, status, serial_number, manufacturer, year, description, image, condition, draw_id, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+
+  col.run('AST-RKLB-001', TX, 'Rocket Production Line — Long Beach (Electron + Neutron tooling)', 'Industrial Equipment', 'equipment', 'filing', 32_000_000_00, 14_000_000_00, 38_000_000_00, 'Long Beach, CA (HQ)', 'Secured', 'RKLB-LBH-MFG-2023', 'Internal + multi-vendor', 2023, 'Manufacturing and integration tooling for Electron and Neutron launch vehicles; equipment schedules under §6 of the Master Agreement.', 'https://picsum.photos/seed/rocket/800/600', 'Excellent', drawEff, Date.now());
+  col.run('AST-RKLB-002', TX, 'SolAero Wafer Production Line — Albuquerque', 'Industrial Equipment', 'equipment', 'filing', 18_500_000_00, 9_200_000_00, 25_000_000_00, 'Albuquerque, NM (SolAero)', 'Secured', 'SOL-ABQ-WAFER-A', 'SolAero / Veeco / Aixtron', 2022, 'III-V multi-junction solar cell wafer fab and test equipment supporting RKLB spacecraft power systems.', 'https://picsum.photos/seed/solar/800/600', 'Excellent', drawEff, Date.now());
+  col.run('AST-RKLB-003', TX, 'Test & Integration Stands — Long Beach + Auburn', 'Industrial Equipment', 'equipment', 'filing', 9_000_000_00, 4_500_000_00, 12_400_000_00, 'Multi-site (CA, WA)', 'Secured', '60.22.0185 (+ schedule)', 'Internal', 2022, 'Hot-fire test stands, vibration / thermal-vacuum chambers, integration cleanrooms. Item 60.22.0185 explicitly grandfathered under §6(b)(5).', 'https://picsum.photos/seed/teststand/800/600', 'Excellent', drawEff, Date.now());
+
+  // ---------- Covenants ----------
+  const cov = db.prepare(`INSERT INTO covenants (id, transaction_id, metric, formula, operator, threshold, unit, frequency, cure_period_days, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`);
+  const cTest = db.prepare(`INSERT INTO covenant_tests (id, covenant_id, transaction_id, period_end, actual_value, status, cushion_pct, source, cert_id, trend, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
+
+  const cv1 = crypto.randomUUID();
+  cov.run(cv1, TX, 'Annual Audited Financials', '10-K within 180 days of FY-end', '<=', 180, 'days', 'annual', 0, Date.now());
+  cTest.run(crypto.randomUUID(), cv1, TX, '2024-12-31', 89, 'pass', 50.6, 'sec_edgar', null, 'stable', Date.now());
+
+  const cv2 = crypto.randomUUID();
+  cov.run(cv2, TX, 'Quarterly Unaudited Financials', '10-Q within 45 days of quarter-end', '<=', 45, 'days', 'quarterly', 0, Date.now());
+  cTest.run(crypto.randomUUID(), cv2, TX, '2025-09-30', 42, 'pass', 6.7, 'sec_edgar', null, 'stable', Date.now());
+
+  const cv3 = crypto.randomUUID();
+  cov.run(cv3, TX, 'Monthly Unaudited Financials', 'Submit within 30 days (non-quarter-end months)', '<=', 30, 'days', 'monthly', 0, Date.now());
+  cTest.run(crypto.randomUUID(), cv3, TX, '2025-10-31', 25, 'pass', 16.7, 'borrower_portal', null, 'stable', Date.now());
+
+  const cv4 = crypto.randomUUID();
+  cov.run(cv4, TX, 'Equipment Location Report', 'Within 30 days of lender request', '<=', 30, 'days', 'on-demand', 0, Date.now());
+  cTest.run(crypto.randomUUID(), cv4, TX, '2025-09-30', 18, 'pass', 40.0, 'borrower_portal', null, 'stable', Date.now());
+
+  const cv5 = crypto.randomUUID();
+  cov.run(cv5, TX, 'Change of Control', '<49% beneficial ownership shift; no board majority turnover (12mo)', '<=', 49, 'percent', 'continuous', 0, Date.now());
+  cTest.run(crypto.randomUUID(), cv5, TX, '2025-Q3', 0, 'pass', 100.0, 'sec_edgar', null, 'stable', Date.now());
+
+  // ---------- Liens ----------
+  const lien = db.prepare(`INSERT INTO liens (id, transaction_id, position, holder, amount_cents, lien_type, collateral_scope, status, filing_date, is_ours, pmsi, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`);
+  lien.run(crypto.randomUUID(), TX, 1, 'Trinity Capital Inc. (Us)', 120_000_000_00, 'Equipment Financing — Senior Secured', 'Equipment Collateral (blanket-released)', 'Perfected', '2023-12-29', 1, 0, 'Blanket lien tranche released Q3 2025 upon repayment of Blanket Lien Draw; UCC-3 amendment filed to narrow collateral description.');
+  lien.run(crypto.randomUUID(), TX, 0, 'Hercules Capital, Inc.', 108_648_103_00, 'Predecessor Senior Secured', 'All Assets (terminated)', 'Terminated', '2021-06-04', 0, 0, 'Predecessor lender; refinanced 2023-12-29 with $108,648,103 payoff. UCC-3 termination filed by Hercules.');
+
+  // ---------- UCC-1 filing ----------
+  db.prepare(`INSERT INTO filings (id, transaction_id, filing_type, status, jurisdiction, debtor_name, debtor_id, debtor_address, secured_party, secured_party_address, collateral_description, file_number, filed_at, lapse_date, continuation_window_open, amends_filing_id, notes, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(crypto.randomUUID(), TX, 'UCC-1', 'confirmed', 'DE', 'Rocket Lab USA, Inc.', rocketLabDebtors['Rocket Lab USA, Inc.'], '3881 McGowen St, Long Beach CA 90808', 'Trinity Capital Inc.', '1 N 1st St #600, Phoenix AZ 85004', 'Equipment Collateral as defined in Master Equipment Financing Agreement dated 2023-12-29 (originally with blanket lien tranche; amended via UCC-3 to narrow to equipment only following Blanket Lien Draw repayment).', '20235621890', '2023-12-29', '2028-12-29', '2028-06-29', null, 'Filed via CSC. UCC-3 amendment narrowing description filed Q3 2025.', Date.now());
+
+  // ---------- alerts specific to this deal ----------
+  const alert = db.prepare(`INSERT INTO alerts (id, type, severity, title, description, transaction_id, acked, created_at) VALUES (?,?,?,?,?,?,?,?)`);
+  alert.run(crypto.randomUUID(), 'blanket_released', 'info', 'Blanket Lien Released', 'Rocket Lab — Blanket Lien Draw repaid Q3 2025. Collateral description narrowed; conditional covenants released.', TX, 0, Date.now() - 86_400_000 * 30);
+  alert.run(crypto.randomUUID(), 'conditional_expired', 'info', 'Conditional Draw Expired', 'Rocket Lab — Conditional Draw B window closed 2025-06-30 with no advance taken.', TX, 1, Date.now() - 86_400_000 * 60);
+
+  // Featured-deal indicator
+  db.prepare(`INSERT INTO settings (key, value) VALUES (?, ?)`).run('featured_transaction_id', TX);
+}
+
+function seedMonitoringAndAttributions() {
+  const TX = 'TRX-2023-011';
+  const sentinel = db.prepare(`SELECT value FROM settings WHERE key = 'monitoring_seeded'`).get() as any;
+  if (sentinel) return;
+  db.prepare(`INSERT OR REPLACE INTO settings (key, value) VALUES ('monitoring_seeded', '1')`).run();
+
+  const rkParent: any = db.prepare(`SELECT d.id FROM debtors d JOIN transaction_debtors td ON td.debtor_id = d.id WHERE td.transaction_id = ? AND td.role = 'parent'`).get(TX);
+
+  // Hercules historical (terminated) filing against Rocket Lab USA
+  if (rkParent) {
+    db.prepare(`INSERT INTO third_party_filings (id, debtor_id, jurisdiction, filing_type, secured_party, collateral_description, file_number, filed_at, lapse_date, terminated_at, detected_at, priority_impact, priority_impact_reason, reviewed, source, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(crypto.randomUUID(), rkParent.id, 'DE', 'UCC-1', 'Hercules Capital, Inc.', 'All assets of debtor — predecessor lender financing, terminated.', '20214327881', '2021-06-04', '2026-06-04', '2023-12-29', Date.now() - 86_400_000 * 7, 'none', 'Terminated prior to our perfection. Historical context only.', 1, 'csc', Date.now());
+  }
+
+  // Watch every Rocket Lab debtor in its state of formation
+  const rkDebtors = db.prepare(`SELECT d.id, d.state_of_formation FROM debtors d JOIN transaction_debtors td ON td.debtor_id = d.id WHERE td.transaction_id = ?`).all(TX) as Array<{ id: string; state_of_formation: string }>;
+  const insertWatch = db.prepare(`INSERT OR IGNORE INTO debtor_watches (id, debtor_id, watch_jurisdiction, status, last_checked_at, next_check_at, created_at) VALUES (?,?,?,?,?,?,?)`);
+  for (const d of rkDebtors) {
+    if (!d.state_of_formation) continue;
+    insertWatch.run(crypto.randomUUID(), d.id, d.state_of_formation, 'active', Date.now() - 3600_000, Date.now() + 23 * 3600_000, Date.now());
+  }
+
+  // Add watches for the other existing transactions' parent debtors too
+  const parents = db.prepare(`SELECT d.id, d.state_of_formation FROM debtors d JOIN transaction_debtors td ON td.debtor_id = d.id WHERE td.role = 'parent'`).all() as Array<{ id: string; state_of_formation: string }>;
+  for (const d of parents) {
+    if (!d.state_of_formation) continue;
+    insertWatch.run(crypto.randomUUID(), d.id, d.state_of_formation, 'active', Date.now() - 7200_000, Date.now() + 22 * 3600_000, Date.now());
+  }
+
+  // Sprinkle simulated third-party filings against random debtors
+  const insertTpf = db.prepare(`INSERT INTO third_party_filings (id, debtor_id, jurisdiction, filing_type, secured_party, collateral_description, file_number, filed_at, detected_at, priority_impact, priority_impact_reason, reviewed, source, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  const otherParents = parents.filter(p => p.id !== rkParent?.id);
+  const samples = [
+    ['Regional Bank Corp', 'Accounts Receivable lien', 'subordinate', 'Subordinate to our blanket; junior in waterfall.'],
+    ['Equipment Leasing Co.', 'Specific manufacturing equipment (PMSI)', 'pari-passu', 'PMSI on specific equipment — supersedes our blanket for those assets only per §9-324.'],
+    ['CIT Bank N.A.', 'Inventory financing', 'subordinate', 'Subordinate per intercreditor agreement.'],
+  ];
+  for (let i = 0; i < otherParents.length && i < samples.length; i++) {
+    const d = otherParents[i];
+    const [party, desc, impact, reason] = samples[i];
+    insertTpf.run(crypto.randomUUID(), d.id, d.state_of_formation || 'DE', 'UCC-1', party, desc, `2024${Math.floor(Math.random() * 9_000_000 + 1_000_000)}`, '2024-09-15', Date.now() - 86_400_000 * 4, impact, reason, 0, 'simulated', Date.now());
+  }
+
+  // ---------- Source attributions ----------
+  const attr = db.prepare(`INSERT INTO source_attributions (id, entity_type, entity_id, field_path, source_type, source_reference, retrieved_at, notes) VALUES (?,?,?,?,?,?,?,?)`);
+  const SEC_EXHIBIT = 'https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0001819994&type=10-K';
+  const SEC_8K = 'https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0001819994&type=8-K';
+
+  // Transaction-level
+  attr.run(crypto.randomUUID(), 'transaction', TX, null, 'sec_edgar', SEC_EXHIBIT, Date.now(), 'Exhibit 10.29 — Master Equipment Financing Agreement, filed with Rocket Lab USA 10-K. SEC EDGAR Accession 0000950170-24-022160.');
+  attr.run(crypto.randomUUID(), 'transaction', TX, 'amount_cents', 'sec_edgar', SEC_8K, Date.now(), 'Rocket Lab 8-K dated 2024-01-04 announcing the Trinity facility.');
+
+  // Every debtor in the Rocket Lab group
+  for (const d of rkDebtors) {
+    attr.run(crypto.randomUUID(), 'debtor', d.id, null, 'sec_edgar', SEC_EXHIBIT, Date.now(), 'Co-borrower per Exhibit 10.29 schedule of Borrowers.');
+  }
+
+  // Liens for this deal
+  const rkLiens = db.prepare('SELECT id FROM liens WHERE transaction_id = ?').all(TX) as Array<{ id: string }>;
+  for (const l of rkLiens) {
+    attr.run(crypto.randomUUID(), 'lien', l.id, null, 'sec_edgar', SEC_EXHIBIT, Date.now(), null);
+  }
+  // Draws
+  const rkDraws = db.prepare('SELECT id FROM draws WHERE transaction_id = ?').all(TX) as Array<{ id: string }>;
+  for (const d of rkDraws) {
+    attr.run(crypto.randomUUID(), 'draw', d.id, null, 'sec_edgar', SEC_EXHIBIT, Date.now(), 'Defined in §1 of the Master Agreement.');
+  }
+  // Filings
+  const rkFilings = db.prepare('SELECT id FROM filings WHERE transaction_id = ?').all(TX) as Array<{ id: string }>;
+  for (const f of rkFilings) {
+    attr.run(crypto.randomUUID(), 'filing', f.id, null, 'csc', 'CSC Filing Gateway (sandbox)', Date.now(), null);
+  }
+  // Collateral
+  const rkCol = db.prepare('SELECT id FROM collateral WHERE transaction_id = ?').all(TX) as Array<{ id: string }>;
+  for (const c of rkCol) {
+    attr.run(crypto.randomUUID(), 'collateral', c.id, null, 'sec_edgar', SEC_EXHIBIT, Date.now(), 'Per Equipment Collateral schedules in Exhibit 10.29.');
+  }
+  // Covenants
+  const rkCov = db.prepare('SELECT id FROM covenants WHERE transaction_id = ?').all(TX) as Array<{ id: string }>;
+  for (const c of rkCov) {
+    attr.run(crypto.randomUUID(), 'covenant', c.id, null, 'sec_edgar', SEC_EXHIBIT, Date.now(), '§5 of the Master Agreement.');
+  }
+
+  // Light attribution for the existing demo transactions
+  const others = db.prepare('SELECT id FROM transactions WHERE id != ?').all(TX) as Array<{ id: string }>;
+  for (const t of others) {
+    attr.run(crypto.randomUUID(), 'transaction', t.id, null, 'simulated', null, Date.now(), 'Synthetic demo data.');
+  }
 }
 
 function computeCushion(op: string, threshold: number, actual: number): number {

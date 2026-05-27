@@ -31,6 +31,17 @@ export function createApi(): Router {
     const rights = db.prepare('SELECT * FROM rights WHERE transaction_id = ?').all(req.params.id);
     const liens = db.prepare('SELECT * FROM liens WHERE transaction_id = ? ORDER BY position').all(req.params.id);
     const collateral = db.prepare('SELECT * FROM collateral WHERE transaction_id = ?').all(req.params.id);
+    const borrowerGroup = db.prepare(`SELECT td.role, td.joined_at, td.released_at, d.* FROM transaction_debtors td JOIN debtors d ON d.id = td.debtor_id WHERE td.transaction_id = ? ORDER BY CASE td.role WHEN 'parent' THEN 0 WHEN 'co-borrower' THEN 1 WHEN 'guarantor' THEN 2 ELSE 3 END, d.legal_name`).all(req.params.id);
+    const draws = db.prepare(`SELECT * FROM draws WHERE transaction_id = ? ORDER BY CASE status WHEN 'outstanding' THEN 0 WHEN 'available' THEN 1 WHEN 'repaid' THEN 2 ELSE 3 END, created_at`).all(req.params.id);
+    const attributions = db.prepare(`SELECT * FROM source_attributions WHERE (entity_type = 'transaction' AND entity_id = ?)
+      OR (entity_type = 'debtor' AND entity_id IN (SELECT debtor_id FROM transaction_debtors WHERE transaction_id = ?))
+      OR (entity_type = 'lien' AND entity_id IN (SELECT id FROM liens WHERE transaction_id = ?))
+      OR (entity_type = 'draw' AND entity_id IN (SELECT id FROM draws WHERE transaction_id = ?))
+      OR (entity_type = 'filing' AND entity_id IN (SELECT id FROM filings WHERE transaction_id = ?))
+      OR (entity_type = 'collateral' AND entity_id IN (SELECT id FROM collateral WHERE transaction_id = ?))
+      OR (entity_type = 'covenant' AND entity_id IN (SELECT id FROM covenants WHERE transaction_id = ?))`).all(req.params.id, req.params.id, req.params.id, req.params.id, req.params.id, req.params.id, req.params.id);
+    const debtorIds = (borrowerGroup as any[]).map(d => d.id);
+    const thirdParty = debtorIds.length === 0 ? [] : db.prepare(`SELECT * FROM third_party_filings WHERE debtor_id IN (${debtorIds.map(() => '?').join(',')}) ORDER BY filed_at DESC`).all(...debtorIds);
     const covenants = db.prepare(`SELECT c.*,
         (SELECT actual_value FROM covenant_tests t WHERE t.covenant_id = c.id ORDER BY t.created_at DESC LIMIT 1) AS latest_actual,
         (SELECT status FROM covenant_tests t WHERE t.covenant_id = c.id ORDER BY t.created_at DESC LIMIT 1) AS latest_status,
@@ -39,7 +50,7 @@ export function createApi(): Router {
       FROM covenants c WHERE c.transaction_id = ? ORDER BY c.created_at`).all(req.params.id);
     const filings = db.prepare('SELECT * FROM filings WHERE transaction_id = ? ORDER BY created_at DESC').all(req.params.id);
     const dacas = db.prepare('SELECT * FROM control_agreements WHERE transaction_id = ?').all(req.params.id);
-    res.json({ ...tx, contacts, mechanics, rights, liens, collateral, covenants, filings, dacas });
+    res.json({ ...tx, contacts, mechanics, rights, liens, collateral, covenants, filings, dacas, borrower_group: borrowerGroup, draws, attributions, third_party_filings: thirdParty });
   });
 
   // ---------- collateral ----------
@@ -339,6 +350,94 @@ export function createApi(): Router {
       LEFT JOIN covenant_tests ct ON ct.id = (SELECT id FROM covenant_tests WHERE covenant_id = c.id ORDER BY created_at DESC LIMIT 1)
       ORDER BY ct.cushion_pct ASC LIMIT 8`).all();
     res.json({ exposureBySector, exposureByJurisdiction, covenantHealth, sharedCollateral, topConcentration, upcomingContinuations, cushion });
+  });
+
+  // ---------- debtors ----------
+  r.get('/debtors', (_req, res) => {
+    res.json(db.prepare(`SELECT d.*,
+      (SELECT json_group_array(json_object('transaction_id', td.transaction_id, 'role', td.role)) FROM transaction_debtors td WHERE td.debtor_id = d.id) AS memberships
+      FROM debtors d ORDER BY d.legal_name`).all());
+  });
+
+  // ---------- draws ----------
+  r.post('/draws/:id/repay', (req, res) => {
+    const draw: any = db.prepare('SELECT * FROM draws WHERE id = ?').get(req.params.id);
+    if (!draw) return res.status(404).json({ error: 'not found' });
+    if (draw.status !== 'outstanding') return res.status(400).json({ error: `draw is ${draw.status}` });
+    const today = new Date().toISOString().slice(0, 10);
+    db.prepare(`UPDATE draws SET status = 'repaid', outstanding_cents = 0, repaid_date = ? WHERE id = ?`).run(today, req.params.id);
+    logAudit({ actor_role: req.body.actor_role ?? 'pm', actor_name: req.body.actor_name ?? 'system', action: 'draw.repay', entity_type: 'draw', entity_id: req.params.id, detail: `${draw.label} (${draw.collateral_pool}) marked repaid.` });
+    const isBlanket = draw.collateral_pool === 'blanket';
+    db.prepare(`INSERT INTO alerts (id, type, severity, title, description, transaction_id, acked, created_at) VALUES (?,?,?,?,?,?,0,?)`)
+      .run(crypto.randomUUID(), 'blanket_released', isBlanket ? 'info' : 'info', isBlanket ? 'Blanket Lien Released' : 'Draw Repaid', `${draw.label} repaid. ${isBlanket ? 'Conditional covenants released; UCC-3 amendment recommended to narrow collateral description.' : 'No collateral release triggered.'}`, draw.transaction_id, Date.now());
+    if (isBlanket) {
+      // Queue a UCC-3 amendment automatically for review.
+      const parentFiling: any = db.prepare(`SELECT * FROM filings WHERE transaction_id = ? AND filing_type = 'UCC-1' AND status = 'confirmed' LIMIT 1`).get(draw.transaction_id);
+      if (parentFiling) {
+        db.prepare(`INSERT INTO filings (id, transaction_id, filing_type, status, jurisdiction, debtor_name, debtor_id, secured_party, collateral_description, amends_filing_id, notes, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+          .run(crypto.randomUUID(), draw.transaction_id, 'UCC-3-amendment', 'draft', parentFiling.jurisdiction, parentFiling.debtor_name, parentFiling.debtor_id, parentFiling.secured_party, `Narrow collateral description to remove blanket lien; specific equipment only (per Master Agreement upon Blanket Lien Draw repayment).`, parentFiling.id, `Auto-queued upon repayment of draw ${draw.id}.`, Date.now());
+      }
+    }
+    res.json({ ok: true });
+  });
+
+  // ---------- monitoring ----------
+  r.get('/monitoring/stats', (_req, res) => {
+    const watched = db.prepare(`SELECT COUNT(DISTINCT debtor_id) AS c FROM debtor_watches WHERE status = 'active'`).get() as any;
+    const jurs = db.prepare(`SELECT COUNT(DISTINCT watch_jurisdiction) AS c FROM debtor_watches WHERE status = 'active'`).get() as any;
+    const thirty = Date.now() - 30 * 86_400_000;
+    const detected = db.prepare(`SELECT COUNT(*) AS c FROM third_party_filings WHERE detected_at >= ?`).get(thirty) as any;
+    const unreviewed = db.prepare(`SELECT COUNT(*) AS c FROM third_party_filings WHERE reviewed = 0`).get() as any;
+    res.json({ debtors_watched: watched.c, active_jurisdictions: jurs.c, detected_30d: detected.c, unreviewed: unreviewed.c });
+  });
+
+  r.get('/monitoring/filings', (req, res) => {
+    const where = req.query.debtor_id ? 'WHERE tpf.debtor_id = ?' : '';
+    const args = req.query.debtor_id ? [req.query.debtor_id] : [];
+    const rows = db.prepare(`SELECT tpf.*, d.legal_name AS debtor_name, d.state_of_formation
+      FROM third_party_filings tpf LEFT JOIN debtors d ON d.id = tpf.debtor_id ${where} ORDER BY tpf.detected_at DESC`).all(...args as any);
+    res.json(rows);
+  });
+
+  r.get('/monitoring/watches', (_req, res) => {
+    const rows = db.prepare(`SELECT w.*, d.legal_name, d.state_of_formation,
+        (SELECT GROUP_CONCAT(DISTINCT t.borrower) FROM transaction_debtors td JOIN transactions t ON t.id = td.transaction_id WHERE td.debtor_id = w.debtor_id) AS deals,
+        (SELECT COUNT(*) FROM third_party_filings tpf WHERE tpf.debtor_id = w.debtor_id) AS detections
+      FROM debtor_watches w LEFT JOIN debtors d ON d.id = w.debtor_id
+      ORDER BY d.legal_name, w.watch_jurisdiction`).all();
+    res.json(rows);
+  });
+
+  r.post('/monitoring/filings/:id/review', (req, res) => {
+    db.prepare('UPDATE third_party_filings SET reviewed = 1 WHERE id = ?').run(req.params.id);
+    logAudit({ actor_role: req.body.actor_role ?? 'pm', actor_name: req.body.actor_name ?? 'system', action: 'tpf.review', entity_type: 'third_party_filing', entity_id: req.params.id, detail: '' });
+    res.json({ ok: true });
+  });
+
+  r.post('/monitoring/simulate', (_req, res) => {
+    const candidates = db.prepare(`SELECT id, legal_name, state_of_formation FROM debtors WHERE is_active = 1 ORDER BY RANDOM() LIMIT 1`).get() as any;
+    if (!candidates) return res.status(400).json({ error: 'no debtors' });
+    const parties = ['Apex Credit Partners', 'Owl Rock Capital', 'Ares Direct Lending', 'Sixth Street Lending', 'Blue Owl Capital', 'Acme Equipment Leasing', 'Pacific Western Bank'];
+    const collaterals = ['All assets of debtor', 'Specific manufacturing equipment (PMSI)', 'Accounts receivable and proceeds', 'Inventory and proceeds', 'Specific titled vehicles'];
+    const impacts: Array<['none' | 'subordinate' | 'pari-passu' | 'senior' | 'unknown', string]> = [
+      ['subordinate', 'Files after our perfection date; subordinate per first-to-file rule.'],
+      ['pari-passu', 'PMSI on specific equipment — supersedes our blanket for those assets per §9-324.'],
+      ['unknown', 'Filing description ambiguous; requires legal review.'],
+    ];
+    const [impact, reason] = impacts[Math.floor(Math.random() * impacts.length)];
+    const id = crypto.randomUUID();
+    db.prepare(`INSERT INTO third_party_filings (id, debtor_id, jurisdiction, filing_type, secured_party, collateral_description, file_number, filed_at, detected_at, priority_impact, priority_impact_reason, reviewed, source, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?,?)`)
+      .run(id, candidates.id, candidates.state_of_formation || 'DE', 'UCC-1', parties[Math.floor(Math.random() * parties.length)], collaterals[Math.floor(Math.random() * collaterals.length)], `2025${Math.floor(Math.random() * 9_000_000 + 1_000_000)}`, new Date().toISOString().slice(0, 10), Date.now(), impact, reason, 'simulated', Date.now());
+    db.prepare(`INSERT INTO alerts (id, type, severity, title, description, acked, created_at) VALUES (?,?,?,?,?,0,?)`)
+      .run(crypto.randomUUID(), 'new_subordinate', impact === 'pari-passu' ? 'warning' : 'info', `New UCC Filing Detected`, `Filing detected against ${candidates.legal_name} (${candidates.state_of_formation}) — ${impact} priority impact.`, Date.now());
+    res.json({ id });
+  });
+
+  // ---------- attributions ----------
+  r.get('/attributions', (req, res) => {
+    const { entity_type, entity_id } = req.query;
+    if (!entity_type || !entity_id) return res.json([]);
+    res.json(db.prepare('SELECT * FROM source_attributions WHERE entity_type = ? AND entity_id = ? ORDER BY retrieved_at DESC').all(entity_type, entity_id));
   });
 
   // ---------- settings ----------

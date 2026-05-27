@@ -158,6 +158,81 @@ export interface ControlAgreement {
   expires_date?: string;
 }
 
+export interface Debtor {
+  id: string;
+  legal_name: string;
+  normalized_name: string;
+  organization_form: string;
+  state_of_formation: string;
+  registered_address?: string;
+  is_active: number;
+  role?: 'parent' | 'co-borrower' | 'guarantor' | 'pledgor';
+  joined_at?: string;
+  released_at?: string;
+}
+
+export interface Draw {
+  id: string;
+  transaction_id: string;
+  label: string;
+  draw_type: string;
+  commitment_cents: number;
+  drawn_cents: number;
+  outstanding_cents: number;
+  available_from?: string;
+  available_until?: string;
+  drawn_date?: string;
+  term_months?: number;
+  rate_factor?: number;
+  collateral_pool?: 'equipment' | 'blanket' | 'mixed';
+  status: 'available' | 'outstanding' | 'repaid' | 'expired';
+  repaid_date?: string;
+  notes?: string;
+}
+
+export interface SourceAttribution {
+  id: string;
+  entity_type: 'transaction' | 'debtor' | 'filing' | 'covenant' | 'lien' | 'collateral' | 'draw';
+  entity_id: string;
+  field_path?: string;
+  source_type: 'sec_edgar' | 'csc' | 'wolters_kluwer' | 'uspto' | 'manual_entry' | 'borrower_portal' | 'simulated';
+  source_reference?: string;
+  retrieved_at: number;
+  notes?: string;
+}
+
+export interface ThirdPartyFiling {
+  id: string;
+  debtor_id: string;
+  debtor_name?: string;
+  jurisdiction: string;
+  filing_type: string;
+  secured_party: string;
+  collateral_description?: string;
+  file_number?: string;
+  filed_at?: string;
+  lapse_date?: string;
+  terminated_at?: string;
+  detected_at: number;
+  priority_impact: 'none' | 'subordinate' | 'pari-passu' | 'senior' | 'unknown';
+  priority_impact_reason?: string;
+  reviewed: number;
+  source: string;
+}
+
+export interface DebtorWatch {
+  id: string;
+  debtor_id: string;
+  legal_name?: string;
+  state_of_formation?: string;
+  watch_jurisdiction: string;
+  status: 'active' | 'paused';
+  last_checked_at: number;
+  next_check_at: number;
+  deals?: string;
+  detections?: number;
+}
+
 export interface TransactionFull extends Transaction {
   contacts: Array<{ role: string; name: string; firm: string; email: string }>;
   mechanics: Array<{ label: string; value: string }>;
@@ -167,4 +242,8 @@ export interface TransactionFull extends Transaction {
   covenants: Covenant[];
   filings: Filing[];
   dacas: ControlAgreement[];
+  borrower_group: Debtor[];
+  draws: Draw[];
+  attributions: SourceAttribution[];
+  third_party_filings: ThirdPartyFiling[];
 }
